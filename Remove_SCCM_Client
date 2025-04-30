@@ -1,0 +1,73 @@
+# Stop SCCM services
+Get-Service -Name ccmexec, smstsmgr, ccmsetup -ErrorAction SilentlyContinue | Stop-Service -Force
+
+# Ensure services are stopped
+Start-Sleep -Seconds 60
+
+
+# Kill any remaining SCCM processes
+$processes = @("ccmexec", "smsexec", "CcmSetup")
+foreach ($process in $processes) {
+    Stop-Process -Name $process -Force -ErrorAction SilentlyContinue
+}
+
+Start-Sleep -Seconds 15
+
+Invoke-Expression -Command "C:\Windows\CCMSetup\ccmsetup.exe /uninstall"
+Start-Sleep -Seconds 1800
+
+
+$folders = @(
+    "C:\Windows\CCM",
+    "C:\Windows\ccmcache",
+    "C:\Windows\CCMSetup",
+    "C:\Program Files\Microsoft Configuration Manager",
+    "C:\ProgramData\Microsoft\CCM"
+)
+
+foreach ($folder in $folders) {
+    if (Test-Path $folder) {
+		Write-Host "Removing $folder " -ForegroundColor Yellow
+        Remove-Item -Path $folder -Recurse -Force -ErrorAction SilentlyContinue
+    }
+}
+
+$regKeys = @(
+    "HKLM:\SOFTWARE\Microsoft\CCM",
+    "HKLM:\SOFTWARE\Microsoft\CCMSetup",
+    "HKLM:\SOFTWARE\Microsoft\SMS",
+    "HKLM:\SYSTEM\CurrentControlSet\Services\CCMExec",
+    "HKLM:\SYSTEM\CurrentControlSet\Services\smstsmgr",
+    "HKLM:\SYSTEM\CurrentControlSet\Services\CcmSetup"
+)
+
+foreach ($key in $regKeys) {
+    if (Test-Path $key) {
+        Remove-Item -Path $key -Recurse -Force -ErrorAction SilentlyContinue
+    }
+}
+
+Get-ScheduledTask | Where-Object {$_.TaskName -like "*CCM*"} | Unregister-ScheduledTask -Confirm:$false
+
+# Remove WMI namespaces related to SCCM
+$wmiNamespaces = @(
+    "root\ccm",
+    "root\cimv2\sms",
+    "root\ccm\policy",
+    "root\ccm\state",
+    "root\ccm\softwareupdates",
+    "root\ccm\softwaremetering"
+)
+
+foreach ($namespace in $wmiNamespaces) {
+    try {
+        $locator = New-Object -ComObject WbemScripting.SWbemLocator
+        $svc = $locator.ConnectServer(".", $namespace)
+        $svc.DeleteNamespace($namespace)
+    } catch {
+        Write-Host "Failed to delete namespace $namespace or it does not exist." -ForegroundColor Yellow
+    }
+}
+
+
+# Restart-Computer -Force
