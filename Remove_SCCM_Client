@@ -1,22 +1,10 @@
-# Stop SCCM services
-Get-Service -Name ccmexec, smstsmgr, ccmsetup -ErrorAction SilentlyContinue | Stop-Service -Force
+# Enable verbose output
+$VerbosePreference = "Continue"
+$remnantsFound = $false
 
-# Ensure services are stopped
-Start-Sleep -Seconds 60
+Write-Host "`n====== SCCM Client Evaluation Report ======" -ForegroundColor Cyan
 
-
-# Kill any remaining SCCM processes
-$processes = @("ccmexec", "smsexec", "CcmSetup")
-foreach ($process in $processes) {
-    Stop-Process -Name $process -Force -ErrorAction SilentlyContinue
-}
-
-Start-Sleep -Seconds 15
-
-Invoke-Expression -Command "C:\Windows\CCMSetup\ccmsetup.exe /uninstall"
-Start-Sleep -Seconds 1800
-
-
+# 1. Folder Checks
 $folders = @(
     "C:\Windows\CCM",
     "C:\Windows\ccmcache",
@@ -24,14 +12,42 @@ $folders = @(
     "C:\Program Files\Microsoft Configuration Manager",
     "C:\ProgramData\Microsoft\CCM"
 )
-
+Write-Verbose "Checking folders..."
 foreach ($folder in $folders) {
     if (Test-Path $folder) {
-		Write-Host "Removing $folder " -ForegroundColor Yellow
-        Remove-Item -Path $folder -Recurse -Force -ErrorAction SilentlyContinue
+        Write-Host "Present: $folder" -ForegroundColor Yellow
+        $remnantsFound = $true
+    } else {
+        Write-Host "Absent : $folder" -ForegroundColor Gray
     }
 }
 
+# 2. Service Checks
+$services = @("ccmexec", "smstsmgr", "ccmsetup", "CmRcService")
+Write-Verbose "Checking services..."
+foreach ($svc in $services) {
+    $s = Get-Service -Name $svc -ErrorAction SilentlyContinue
+    if ($s) {
+        Write-Host "Present: Service '$svc'" -ForegroundColor Yellow
+        $remnantsFound = $true
+    } else {
+        Write-Host "Absent : Service '$svc'" -ForegroundColor Gray
+    }
+}
+
+# 3. Process Check
+$processes = @("ccmexec", "smsexec", "CcmSetup")
+Write-Verbose "Checking processes..."
+foreach ($proc in $processes) {
+    if (Get-Process -Name $proc -ErrorAction SilentlyContinue) {
+        Write-Host "Running : Process '$proc'" -ForegroundColor Yellow
+        $remnantsFound = $true
+    } else {
+        Write-Host "Not running: $proc" -ForegroundColor Gray
+    }
+}
+
+# 4. Registry Keys
 $regKeys = @(
     "HKLM:\SOFTWARE\Microsoft\CCM",
     "HKLM:\SOFTWARE\Microsoft\CCMSetup",
@@ -40,16 +56,27 @@ $regKeys = @(
     "HKLM:\SYSTEM\CurrentControlSet\Services\smstsmgr",
     "HKLM:\SYSTEM\CurrentControlSet\Services\CcmSetup"
 )
-
+Write-Verbose "Checking registry keys..."
 foreach ($key in $regKeys) {
     if (Test-Path $key) {
-        Remove-Item -Path $key -Recurse -Force -ErrorAction SilentlyContinue
+        Write-Host "Present: Registry '$key'" -ForegroundColor Yellow
+        $remnantsFound = $true
+    } else {
+        Write-Host "Absent : Registry '$key'" -ForegroundColor Gray
     }
 }
 
-Get-ScheduledTask | Where-Object {$_.TaskName -like "*CCM*"} | Unregister-ScheduledTask -Confirm:$false
+# 5. Start Menu Shortcut
+$shortcut = "C:\ProgramData\Microsoft\Windows\Start Menu\Programs\Microsoft Endpoint Manager\Configuration Manager\Software Center.lnk"
+Write-Verbose "Checking Software Center shortcut..."
+if (Test-Path $shortcut) {
+    Write-Host "Present: Shortcut '$shortcut'" -ForegroundColor Yellow
+    $remnantsFound = $true
+} else {
+    Write-Host "Absent : Shortcut '$shortcut'" -ForegroundColor Gray
+}
 
-# Remove WMI namespaces related to SCCM
+# 6. WMI Namespaces
 $wmiNamespaces = @(
     "root\ccm",
     "root\cimv2\sms",
@@ -58,16 +85,205 @@ $wmiNamespaces = @(
     "root\ccm\softwareupdates",
     "root\ccm\softwaremetering"
 )
-
-foreach ($namespace in $wmiNamespaces) {
+Write-Verbose "Checking WMI namespaces..."
+foreach ($ns in $wmiNamespaces) {
     try {
         $locator = New-Object -ComObject WbemScripting.SWbemLocator
-        $svc = $locator.ConnectServer(".", $namespace)
-        $svc.DeleteNamespace($namespace)
+        $svc = $locator.ConnectServer(".", $ns)
+        $null = $svc.InstancesOf("__Namespace")
+        Write-Host "Present: WMI namespace '$ns'" -ForegroundColor Yellow
+        $remnantsFound = $true
     } catch {
-        Write-Host "Failed to delete namespace $namespace or it does not exist." -ForegroundColor Yellow
+        Write-Host "Absent : WMI namespace '$ns'" -ForegroundColor Gray
     }
 }
 
+Write-Host "`n====== Evaluation Result ======" -ForegroundColor Cyan
+if ($remnantsFound) {
+    Write-Host "SCCM client is partially or fully installed." -ForegroundColor Red
+    Write-Host "Continuing to remediation" -ForegroundColor Red
+} else {
+    Write-Host "SCCM client is fully removed." -ForegroundColor Green
+    exit 0
+}
 
-# Restart-Computer -Force
+# Enable verbose output
+$VerbosePreference = "Continue"
+
+Write-Host "`n====== SCCM Client Remediation ======" -ForegroundColor Cyan
+
+# 1. Stop SCCM-related services
+$services = @("ccmexec", "smstsmgr", "ccmsetup")
+Write-Verbose "Checking and stopping services..."
+foreach ($svcName in $services) {
+    $svc = Get-Service -Name $svcName -ErrorAction SilentlyContinue
+    if ($svc) {
+        Write-Host "Found service '$svcName'. Attempting to stop..." -ForegroundColor Yellow
+        try {
+            Stop-Service -Name $svcName -Force -ErrorAction Stop
+            Write-Host "Successfully stopped '$svcName'" -ForegroundColor Green
+        } catch {
+            Write-Host "Failed to stop '$svcName': $_" -ForegroundColor Red
+        }
+    } else {
+        Write-Host "Service '$svcName' not found." -ForegroundColor Gray
+    }
+}
+Start-Sleep -Seconds 45
+
+# 2. Kill related processes
+$processes = @("ccmexec", "smsexec", "CcmSetup")
+Write-Verbose "Checking and stopping processes..."
+foreach ($proc in $processes) {
+    $p = Get-Process -Name $proc -ErrorAction SilentlyContinue
+    if ($p) {
+        Write-Host "Found process '$proc'. Attempting to kill..." -ForegroundColor Yellow
+        try {
+            Stop-Process -Name $proc -Force -ErrorAction Stop
+            Write-Host "Successfully killed '$proc'" -ForegroundColor Green
+        } catch {
+            Write-Host "Failed to kill '$proc': $_" -ForegroundColor Red
+        }
+    } else {
+        Write-Host "Process '$proc' not found." -ForegroundColor Gray
+    }
+}
+Start-Sleep -Seconds 45
+
+# 3. Uninstall SCCM Client
+$uninstallCmd = "C:\Windows\CCMSetup\ccmsetup.exe /uninstall"
+if (Test-Path "C:\Windows\CCMSetup\ccmsetup.exe") {
+    Write-Host "Uninstalling SCCM client..." -ForegroundColor Yellow
+    try {
+        Start-Process -FilePath "C:\Windows\CCMSetup\ccmsetup.exe" -ArgumentList "/uninstall" -Wait -ErrorAction Stop
+        Write-Host "Uninstall command completed." -ForegroundColor Green
+    } catch {
+        Write-Host "Uninstall failed: $_" -ForegroundColor Red
+    }
+    Start-Sleep -Seconds 1800
+} else {
+    Write-Host "CCMSetup not found. Skipping uninstall step." -ForegroundColor Gray
+}
+
+# 4. Remove folders
+$folders = @(
+    "C:\Windows\CCM",
+    "C:\Windows\ccmcache",
+    "C:\Windows\CCMSetup",
+    "C:\Program Files\Microsoft Configuration Manager",
+    "C:\ProgramData\Microsoft\CCM"
+)
+Write-Verbose "Removing folders..."
+foreach ($folder in $folders) {
+    if (Test-Path $folder) {
+        Write-Host "Found folder '$folder'. Attempting to remove..." -ForegroundColor Yellow
+        try {
+            Remove-Item -Path $folder -Recurse -Force -ErrorAction Stop
+            Write-Host "Removed '$folder'" -ForegroundColor Green
+        } catch {
+            Write-Host "Failed to remove '$folder': $_" -ForegroundColor Red
+        }
+    } else {
+        Write-Host "Folder '$folder' not found." -ForegroundColor Gray
+    }
+}
+
+# 5. Remove registry keys
+$regKeys = @(
+    "HKLM:\SOFTWARE\Microsoft\CCM",
+    "HKLM:\SOFTWARE\Microsoft\CCMSetup",
+    "HKLM:\SOFTWARE\Microsoft\SMS",
+    "HKLM:\SYSTEM\CurrentControlSet\Services\CCMExec",
+    "HKLM:\SYSTEM\CurrentControlSet\Services\smstsmgr",
+    "HKLM:\SYSTEM\CurrentControlSet\Services\CcmSetup"
+)
+Write-Verbose "Removing registry keys..."
+foreach ($key in $regKeys) {
+    if (Test-Path $key) {
+        Write-Host "Found registry key '$key'. Attempting to remove..." -ForegroundColor Yellow
+        try {
+            Remove-Item -Path $key -Recurse -Force -ErrorAction Stop
+            Write-Host "Removed '$key'" -ForegroundColor Green
+        } catch {
+            Write-Host "Failed to remove '$key': $_" -ForegroundColor Red
+        }
+    } else {
+        Write-Host "Registry key '$key' not found." -ForegroundColor Gray
+    }
+}
+
+# 6. Remove SCCM-related scheduled tasks
+Write-Verbose "Removing scheduled tasks..."
+try {
+    $tasks = Get-ScheduledTask | Where-Object { $_.TaskName -like "*CCM*" }
+    if ($tasks) {
+        foreach ($task in $tasks) {
+            Write-Host "Removing scheduled task: $($task.TaskName)" -ForegroundColor Yellow
+            Unregister-ScheduledTask -TaskName $task.TaskName -Confirm:$false -ErrorAction Stop
+            Write-Host "Removed task: $($task.TaskName)" -ForegroundColor Green
+        }
+    } else {
+        Write-Host "No matching scheduled tasks found." -ForegroundColor Gray
+    }
+} catch {
+    Write-Host "Error checking/removing scheduled tasks: $_" -ForegroundColor Red
+}
+
+# 7. Remove WMI namespaces
+$wmiNamespaces = @(
+    "root\ccm",
+    "root\cimv2\sms",
+    "root\ccm\policy",
+    "root\ccm\state",
+    "root\ccm\softwareupdates",
+    "root\ccm\softwaremetering"
+)
+Write-Verbose "Removing WMI namespaces..."
+foreach ($ns in $wmiNamespaces) {
+    try {
+        $locator = New-Object -ComObject WbemScripting.SWbemLocator
+        $svc = $locator.ConnectServer(".", $ns)
+        $null = $svc.InstancesOf("__Namespace")
+        Write-Host "Found WMI namespace '$ns'. Attempting to delete..." -ForegroundColor Yellow
+        $svc.DeleteNamespace($ns)
+        Write-Host "Deleted WMI namespace '$ns'" -ForegroundColor Green
+    } catch {
+        Write-Host "WMI namespace '$ns' not found or failed to delete: $_" -ForegroundColor Gray
+    }
+}
+
+# 8. Remove Software Center shortcut
+$scShortcut = "C:\ProgramData\Microsoft\Windows\Start Menu\Programs\Microsoft Endpoint Manager\Configuration Manager\Software Center.lnk"
+if (Test-Path $scShortcut) {
+    Write-Host "Found shortcut. Removing '$scShortcut'..." -ForegroundColor Yellow
+    try {
+        Remove-Item -Path $scShortcut -Force -ErrorAction Stop
+        Write-Host "Removed shortcut." -ForegroundColor Green
+    } catch {
+        Write-Host "Failed to remove shortcut: $_" -ForegroundColor Red
+    }
+} else {
+    Write-Host "Shortcut not found." -ForegroundColor Gray
+}
+
+# 9. Remove empty parent folders
+$parentFolders = @(
+    "C:\ProgramData\Microsoft\Windows\Start Menu\Programs\Microsoft Endpoint Manager",
+    "C:\ProgramData\Microsoft\Windows\Start Menu\Programs\Configuration Manager"
+)
+Write-Verbose "Cleaning up parent folders..."
+foreach ($folder in $parentFolders) {
+    if (Test-Path $folder) {
+        Write-Host "Attempting to remove empty folder: '$folder'" -ForegroundColor Yellow
+        try {
+            Remove-Item -Path $folder -Recurse -Force -ErrorAction Stop
+            Write-Host "Removed '$folder'" -ForegroundColor Green
+        } catch {
+            Write-Host "Failed to remove '$folder': $_" -ForegroundColor Red
+        }
+    } else {
+        Write-Host "Folder '$folder' not found." -ForegroundColor Gray
+    }
+}
+
+Write-Host "`n====== Remediation Complete ======" -ForegroundColor Cyan
