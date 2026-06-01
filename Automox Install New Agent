@@ -1,0 +1,150 @@
+# -------------------------------
+# CONFIGURATION AND SETUP
+# -------------------------------
+$serviceDisplayName = "Automox Agent"
+$destinationDirectory = "C:\Temp"
+$installerName = "Automox_Installer-latest.msi"
+$destination = Join-Path $destinationDirectory $installerName
+$logFileName = "Automox_Update_Log.txt"
+$logPath = Join-Path $destinationDirectory $logFileName
+$downloadUrl = "https://console.automox.com/installers/$installerName"
+$accessKey = ""
+
+# -------------------------------
+# CUSTOM LOGGING FUNCTION
+# -------------------------------
+if (-not (Test-Path -Path $destinationDirectory -PathType Container)) {
+    New-Item -Path $destinationDirectory -ItemType Directory -Force | Out-Null
+}
+function Log {
+    param ([string]$message, [string]$level = "INFO")
+    $timestamp = Get-Date -Format "yyyy-MM-dd HH:mm:ss"
+    $formatted = "$timestamp [$level] $message"
+    $formatted | Out-File -Append -FilePath $logPath
+    Write-Output $formatted
+}
+
+Log "==== Automox Update Script Started ===="
+
+# GET SYSTEM UPTIME 
+$systemUptime = ((Get-Date) - (Get-CimInstance Win32_OperatingSystem -ComputerName $Server).LastBootupTime).TotalDays
+Log "System Uptime (days) : $systemUptime"
+
+
+# -------------------------------
+# ALWAYS STOP THE SERVICE FIRST
+# -------------------------------
+$service = Get-Service -Name $serviceDisplayName -ErrorAction SilentlyContinue
+
+if ($service) {
+    Log "Found service '$serviceDisplayName'. Checking status..."
+    $serviceObject = Get-WmiObject -Class Win32_Service -Filter "Name='$($service.Name)'" -ErrorAction SilentlyContinue
+
+    if ($service.Status -eq 'Running') {
+        Log "Service is running. Attempting to stop..."
+        Stop-Service -Name $service.Name -Force -ErrorAction SilentlyContinue
+        Start-Sleep -Seconds 5
+        $service.Refresh()
+    }
+
+    if ($service.Status -eq 'StopPending') {
+        Log "Service is stuck in StopPending. Killing the process..."
+        if ($serviceObject -and $serviceObject.ProcessId -ne 0) {
+            Stop-Process -Id $serviceObject.ProcessId -Force -ErrorAction SilentlyContinue
+            Start-Sleep -Seconds 10
+            $service.Refresh()
+        } else {
+            Log "No valid process ID found to terminate." "WARN"
+        }
+    }
+
+    $service.Refresh()
+    if ($service.Status -eq 'Stopped') {
+        Log "Service '$serviceDisplayName' successfully stopped."
+    } else {
+        Log "Service '$serviceDisplayName' could not be stopped properly. Current status: $($service.Status)" "WARN"
+    }
+
+} else {
+    Log "Service '$serviceDisplayName' not found. Proceeding anyway..." "WARN"
+}
+
+# -------------------------------
+# FETCH LATEST VERSION FROM AUTOMOX API
+# -------------------------------
+try {
+    $latestAgent = Invoke-RestMethod -Uri "https://console.automox.com/api/info" -Method Get
+    $latestVer = [version]$latestAgent.agent_version
+    Log "Latest Automox Agent version available: $latestVer"
+} catch {
+    Log "Could not resolve latest Automox Agent version from API. Exiting: $_" "ERROR"
+    Exit 1
+}
+
+# -------------------------------
+# GET INSTALLED VERSION USING AMAGENT CLI
+# -------------------------------
+try {
+    $amagentOutput = & amagent version 2>$null
+    if ($amagentOutput -match '(\d+\.\d+\.\d+)') {
+        $currentVersion = [version]$matches[1]
+        Log "Currently installed Automox Agent version: $currentVersion"
+    } else {
+        Log "Unable to parse version from 'amagent' output. Proceeding with install." "WARN"
+        $currentVersion = [version]"1.0.41"
+    }
+} catch {
+    Log "'amagent' command not found. Assuming Automox Agent not installed. Proceeding with install." "WARN"
+    $currentVersion = [version]"1.0.41"
+}
+
+# -------------------------------
+# CONDITIONAL INSTALL BASED ON VERSION
+# -------------------------------
+if ($currentVersion -ge $latestVer) {
+    Log "Agent is already up-to-date (version $currentVersion). Skipping installation."
+} elseif ($currentVersion -lt [version]"1.0.40") {
+    Log "Agent version $currentVersion is older than 1.0.40. A manual reinstall is recommended. Skipping automated install." "WARN"
+} else {
+    # -------------------------------
+    # INSTALL NEWER VERSION
+    # -------------------------------
+    if (-not (Test-Path -Path $destinationDirectory -PathType Container)) {
+        New-Item -Path $destinationDirectory -ItemType Directory -Force | Out-Null
+        Log "Created '$destinationDirectory'."
+    }
+
+    [Net.ServicePointManager]::SecurityProtocol = [Net.SecurityProtocolType]::Tls12
+
+    Log "Downloading latest installer..."
+    $client = New-Object Net.WebClient
+    $client.Headers["User-Agent"] = 'ax:ax-agent-deployer/Crowdstrike 0.1.4 (Windows)'
+    $client.DownloadFile($downloadUrl, $destination)
+    Log "Download completed."
+
+    Log "Installing Automox Agent..."
+    Start-Process msiexec.exe -ArgumentList "/i `"$destination`" /qn /norestart ACCESSKEY=$accessKey" -Wait
+    Log "Installation complete."
+
+    Remove-Item $destination -Force -ErrorAction SilentlyContinue
+    Log "Installer removed."
+}
+
+# -------------------------------
+# ALWAYS START SERVICE AFTERWARD
+# -------------------------------
+$service = Get-Service -Name $serviceDisplayName -ErrorAction SilentlyContinue
+if ($service) {
+    Log "Starting service '$serviceDisplayName'..."
+    Start-Service -Name $service.Name -ErrorAction SilentlyContinue
+    #Start-Sleep -Seconds 15
+    #Restart-Service -Name $service.Name -ErrorAction SilentlyContinue
+    Log "Service started successfully."
+} else {
+    Log "Service not found after install. Please verify installation completed correctly." "WARN"
+}
+
+# -------------------------------
+# DONE
+# -------------------------------
+Log "Automox Agent update and service restart completed."
