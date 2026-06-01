@@ -1,0 +1,51 @@
+# Ordered output for clean JSON reporting
+$result = [ordered]@{
+    NewOutlookAppxPresent = $false
+    ClassicOutlookPresent = $false
+    ClassicOutlookVersion = $null
+    ClassicOutlookBuild   = $null
+    TenoriteAvailable     = $false
+    FontServiceHTTP       = $false
+}
+
+# --- Font service reachable ---
+$fontServiceTest = Test-NetConnection -ComputerName fs.microsoft.com -Port 443 -ErrorAction SilentlyContinue
+$result.FontServiceHTTP = $fontServiceTest.TcpTestSucceeded
+
+# --- New Outlook AppX presence ---
+$result.NewOutlookAppxPresent = (Get-AppxPackage -Name *OutlookForWindows* -ErrorAction SilentlyContinue) -ne $null
+
+# --- Classic Outlook presence + version ---
+$outlookPath = "C:\Program Files\Microsoft Office\root\Office16\OUTLOOK.EXE"
+if (Test-Path $outlookPath) {
+    $result.ClassicOutlookPresent = $true
+    try {
+        $fileVersionInfo = (Get-Item $outlookPath).VersionInfo
+        $result.ClassicOutlookVersion = $fileVersionInfo.ProductVersion
+        $result.ClassicOutlookBuild   = $fileVersionInfo.FileBuildPart
+    } catch {
+        $result.ClassicOutlookVersion = "Error reading version"
+    }
+}
+
+# --- Tenorite availability via Word COM ---
+$fontName = "Tenorite"
+$hasFont = $false
+try {
+    $word = New-Object -ComObject Word.Application
+    $fonts = $word.FontNames
+    foreach ($f in $fonts) {
+        if ($f -eq $fontName) { $hasFont = $true; break }
+    }
+} catch {
+    # ignore errors if Word isn't installed or COM fails
+} finally {
+    if ($word) {
+        $word.Quit()
+        [System.Runtime.Interopservices.Marshal]::ReleaseComObject($word) | Out-Null
+    }
+}
+$result.TenoriteAvailable = $hasFont
+
+# --- Output ---
+$result | ConvertTo-Json -Compress
